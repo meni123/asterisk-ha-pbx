@@ -3,7 +3,7 @@
 # asterisk-ha-pbx
 
 **מרכזיית Asterisk עצמאית — תפריט טלפוני, עוזר קולי והתראות קוליות —
-תואמת לאינטגרציית [ha_ivr](https://github.com/meni123/ha_ivr) של Home Assistant.**
+תואמת לאינטגרציית [ha_ivr](https://github.com/meni123/ha-ivr) של Home Assistant.**
 
 [English](README.en.md) · [התקנה מהירה](INSTALL.md) · [התקנה ידנית](INSTALL-manual.md)
 
@@ -58,7 +58,7 @@ AudioSocket. להתראה — ha_ivr פונה לשרת שמקשיב ומחייג
 
 - **Debian 13 (trixie)** נקי, גישת root.
 - **Home Assistant** עם האינטגרציה
-  [ha_ivr](https://github.com/meni123/ha_ivr) ורשומת ספק "מרכזייה עצמית".
+  [ha_ivr](https://github.com/meni123/ha-ivr) ורשומת ספק "מרכזייה עצמית".
 - **טראנק SIP** מספק טלפוניה.
 
 ## התקנה
@@ -74,7 +74,7 @@ sudo bash install.sh --ha <כתובת-ה-HA-שלך>
 
 המוח ב-ha_ivr, השרת דק. החוזה בין השניים (פורמט הבקשות, פרוטוקול
 ה-AudioSocket) מתועד במקום אחד סמכותי — ב-ha_ivr, תחת
-[`docs/pbx.md`](https://github.com/meni123/ha_ivr/blob/main/docs/pbx.md).
+[`docs/pbx.md`](https://github.com/meni123/ha-ivr/blob/main/docs/pbx.md).
 
 ## אבטחה
 

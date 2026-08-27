@@ -3,7 +3,7 @@
 # asterisk-ha-pbx
 
 **A self-hosted Asterisk PBX — phone menu, voice assistant, and voice
-alerts — that connects to the [ha_ivr](https://github.com/meni123/ha_ivr)
+alerts — that connects to the [ha_ivr](https://github.com/meni123/ha-ivr)
 Home Assistant integration.**
 
 [עברית](README.md) · [Quick install](INSTALL.md) · [Manual install](INSTALL-manual.md)
@@ -60,7 +60,7 @@ listener that places the call.
 
 - **Debian 13 (trixie)**, clean, root access.
 - **Home Assistant** with the
-  [ha_ivr](https://github.com/meni123/ha_ivr) integration and a
+  [ha_ivr](https://github.com/meni123/ha-ivr) integration and a
   "self-hosted PBX" provider record.
 - A **SIP trunk** from a telephony provider.
 
@@ -78,7 +78,7 @@ sudo bash install.sh --ha <your-HA-address>
 The brain lives in ha_ivr; the server is thin. The contract between them
 (request format, AudioSocket protocol) is documented in one authoritative
 place — in ha_ivr, under
-[`docs/pbx.md`](https://github.com/meni123/ha_ivr/blob/main/docs/pbx.md).
+[`docs/pbx.md`](https://github.com/meni123/ha-ivr/blob/main/docs/pbx.md).
 
 ## Security
 
