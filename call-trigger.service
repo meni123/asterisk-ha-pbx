@@ -1,0 +1,23 @@
+[Unit]
+Description=PBX alert webhook (Home Assistant)
+After=network.target asterisk.service
+
+[Service]
+User=asterisk
+Group=asterisk
+EnvironmentFile=/etc/pbx-alert.env
+Environment="REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
+ExecStart=/usr/bin/python3 /usr/local/lib/pbx-alert/call_trigger.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+# Alert audio is written to /var/lib/asterisk/alert-audio, NOT /tmp, because
+# asterisk.service itself runs with PrivateTmp=true: its /tmp is a private
+# namespace, so anything this service put in the real /tmp was invisible to
+# Playback and every alert call dropped the moment it was answered. Adding
+# PrivateTmp here would break the shared directory in the same way.
+
+[Install]
+WantedBy=multi-user.target

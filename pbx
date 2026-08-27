@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""pbx — unified operator front-end for this Asterisk box.
+
+One entry point instead of three scripts: trunks, the HA_IVR link, the alert
+secret, system status, and the installer.
+
+  * This file is the FRONT-END: prompts, menu, status, and a progress filter
+    over the installer.
+  * install.sh is the ENGINE: it takes its inputs as flags (--ha) and bakes in
+    no site-specific value. `pbx install` asks for the address, passes the flag,
+    and shows only milestone and outcome lines — the ~400 lines of build output
+    nobody reads are hidden, and the full log stays at /var/log/pbx-install.log.
+
+LANGUAGE: English, deliberately. A Hebrew CLI is not practical:
+terminals disagree about the Unicode bidi algorithm, and the two
+families need OPPOSITE byte orders (logical vs visual) to render Hebrew
+correctly. No byte sequence is right in both, and RLM/LRM marks do not help —
+a terminal that ignores bidi ignores those too. A Hebrew interface therefore
+belongs in a browser (dir="rtl" is universal), not a terminal. See INSTALL.md.
+
+Standard library only. Run with sudo:
+    sudo ./pbx                 # menu
+    sudo ./pbx trunk add|list|remove
+    sudo ./pbx haivr set|show|test [number]
+    sudo ./pbx secret | status | install
+"""
+from __future__ import annotations
+
+import configparser
+import getpass
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+# --- paths ------------------------------------------------------------------
+TRUNKS_FILE = "/etc/asterisk/pjsip_trunks.conf"
+HAIVR_CONFIG = "/var/lib/asterisk/agi-bin/config.ini"
+ALERT_ENV = "/etc/pbx-alert.env"
+RELAY = "/var/lib/asterisk/agi-bin/ha_relay.py"
+ASTERISK = "/usr/sbin/asterisk"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+OWNER, GROUP = "asterisk", "asterisk"
+TRUNK_MODE, CONFIG_MODE = 0o640, 0o600
+
+EDGE_SAY_DEFAULT = "/var/lib/asterisk/agi-bin/edge_say.sh"
+ERROR_AUDIO_DEFAULT = "beeperr"
+
+# Inbound context a provider trunk lands in. For this box the answer is almost
+# always from-external: that is where ha_relay.py runs — it plays the HA_IVR
+# menu, collects DTMF, then branches to the AudioSocket assistant or the Opus
+# endpoint per what HA_IVR returns. Those internal targets are chosen by HA_IVR
+# at call time, not by the trunk, so they are not offered as landing contexts.
+DEFAULT_CONTEXT = "from-external"
+
+BEGIN = ";=== TRUNK {name} ==="
+END = ";=== END TRUNK {name} ==="
+
+
+# --- Hebrew UI helpers ------------------------------------------------------
+
+def title(text: str) -> None:
+    print(f"\n═══ {text} ═══\n")
+
+
+def ok(text: str) -> None:
+    print(f"  ✓ {text}")
+
+
+def bad(text: str) -> None:
+    print(f"  ✗ {text}")
+
+
+def warn(text: str) -> None:
+    print(f"  ⚠ {text}")
+
+
+def note(text: str) -> None:
+    print(f"  {text}")
+
+
+def die(text: str) -> None:
+    print(f"\n  ✗ {text}\n", file=sys.stderr)
+    sys.exit(1)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        die("must run as root — e.g.  sudo ./pbx")
+
+
+def ask(label: str, example: str = "", default: str = "", required: bool = True,
+        secret: bool = False) -> str:
+    """Prompt in style C: label on its own line, input on a '> ' line."""
+    while True:
+        hint = []
+        if example:
+            hint.append(f"e.g. {example}")
+        if default:
+            hint.append(f"default: {default}")
+        suffix = f"  ({'; '.join(hint)})" if hint else ""
+        prompt = f"{label}{suffix}: "
+        value = (getpass.getpass(prompt) if secret else input(prompt)).strip()
+        value = value or default
+        if value or not required:
+            return value
+        note("(required)")
+
+
+def yesno(label: str, default: bool) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        value = input(f"{label} [{hint}]: ").strip().lower()
+        if not value:
+            return default
+        if value in ("y", "yes"):
+            return True
+        if value in ("n", "no"):
+            return False
+
+
+def choose(label: str, options: list[tuple[str, str]], default: str = "1") -> str:
+    """options = [(key, hebrew description)]; returns the chosen key."""
+    print(f"\n{label}")
+    for key, desc in options:
+        print(f"    {key}) {desc}")
+    while True:
+        value = input(f"choose [{default}]: ").strip() or default
+        if value in [k for k, _ in options]:
+            return value
+        note("no such choice")
+
+
+def pause() -> None:
+    input("\n(Enter to return to the menu) ")
+
+
+# --- shared file helpers ----------------------------------------------------
+
+def prune_backups(path: str, keep: int = 3) -> None:
+    for old in sorted(glob.glob(f"{path}.bak-*"))[:-keep]:
+        try:
+            os.unlink(old)
+        except OSError:
+            pass
+
+
+def backup(path: str) -> None:
+    if os.path.exists(path):
+        dst = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        shutil.copy2(path, dst)
+        note(f"backed up -> {dst}")
+        prune_backups(path)
+
+
+def write_secure(path: str, content: str, mode: int) -> None:
+    """Atomic write + ownership. Never leaves a half-written config behind."""
+    backup(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.replace(tmp, path)
+    try:
+        shutil.chown(path, OWNER, GROUP)
+    except (LookupError, PermissionError) as exc:
+        warn(f"could not chown {path}: {exc}")
+    os.chmod(path, mode)
+
+
+def asterisk_rx(command: str) -> str:
+    try:
+        res = subprocess.run([ASTERISK, "-rx", command],
+                             capture_output=True, text=True, timeout=10)
+        return res.stdout
+    except Exception:
+        return ""
+
+
+# --- trunks -----------------------------------------------------------------
+
+def trunks_text() -> str:
+    if not os.path.exists(TRUNKS_FILE):
+        return ""
+    with open(TRUNKS_FILE, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def trunk_names(content: str) -> list[str]:
+    return re.findall(r";=== TRUNK (\S+) ===", content)
+
+
+def strip_trunk(content: str, name: str) -> str:
+    pattern = re.compile(
+        re.escape(BEGIN.format(name=name)) + r".*?" +
+        re.escape(END.format(name=name)) + r"\n?", re.DOTALL)
+    return pattern.sub("", content)
+
+
+def build_trunk(name: str, host: str, username: str, password: str,
+                register: bool, context: str, port: str) -> str:
+    """Known-good provider trunk: alaw/ulaw, NAT-friendly, direct_media=no."""
+    server = f"{host}:{port}" if port and port != "5060" else host
+    lines = [BEGIN.format(name=name),
+             f"; provider trunk '{name}' — generated by pbx"]
+
+    if register:
+        lines += [
+            f"[{name}-reg]",
+            "type=registration",
+            "transport=transport-udp",
+            f"outbound_auth={name}-auth",
+            f"server_uri=sip:{server}",
+            f"client_uri=sip:{username}@{host}",
+            "retry_interval=60",
+            "forbidden_retry_interval=300",
+            "expiration=60",                 # 1-min re-register holds the NAT pinhole
+            "line=yes",
+            f"endpoint={name}",
+            "",
+        ]
+
+    if password:
+        lines += [
+            f"[{name}-auth]",
+            "type=auth",
+            "auth_type=userpass",
+            f"username={username}",
+            f"password={password}",
+            "",
+        ]
+
+    lines += [
+        f"[{name}-aor]",
+        "type=aor",
+        f"contact=sip:{server}",
+        # No qualify_frequency: many ITSPs (e.g. Yemot) ignore OPTIONS, so the
+        # static contact gets marked Unavailable and Asterisk then refuses to
+        # place outbound calls ("Could not create dialog to invalid URI").
+        # Registration keeps the trunk alive; qualify actively breaks outbound.
+        "",
+        f"[{name}]",
+        "type=endpoint",
+        "transport=transport-udp",
+        f"context={context}",
+        "disallow=all",
+        "allow=alaw",                        # providers speak G.711; opus not offered here
+        "allow=ulaw",
+        "direct_media=no",                   # stay in the media path
+        "rtp_symmetric=yes",                 # NAT
+        "force_rport=yes",
+        "rewrite_contact=yes",
+        f"aors={name}-aor",
+    ]
+    if password:
+        lines.append(f"outbound_auth={name}-auth")
+    if username:
+        lines.append(f"from_user={username}")
+    lines.append(f"from_domain={host}")
+    lines += [
+        "",
+        f"[{name}-identify]",
+        "type=identify",
+        f"endpoint={name}",
+        # NOTE: a provider answering from several media/proxy addresses may need
+        # extra match= lines here (one per address).
+        f"match={host}",
+        "",
+        END.format(name=name),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def reload_pjsip() -> None:
+    print("\n  reloading pjsip ...")
+    subprocess.run([ASTERISK, "-rx", "pjsip reload"],
+                   capture_output=True, check=False)
+    time.sleep(1)
+    print("\n  --- pjsip show registrations ---")
+    print(asterisk_rx("pjsip show registrations") or "  (no output)")
+
+
+def trunk_add() -> None:
+    content = trunks_text()
+    title("add a SIP trunk")
+    note("Use the trunk dedicated to this PBX.")
+    note("SIP routes inbound calls to whoever registered LAST: if these")
+    note("credentials are already active on another PBX, this box takes over.")
+
+    name = ask("trunk name (letters, digits, underscore)", example="mytest")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", name):
+        die("name must be letters, digits or underscore")
+    if name in trunk_names(content):
+        if not yesno(f"trunk '{name}' exists — replace it?", False):
+            note("aborted.")
+            return
+        content = strip_trunk(content, name)
+
+    host = ask("provider host / domain", example="sip.example.com")
+    port = ask("provider port", default="5060")
+    register = yesno("does this trunk REGISTER? (no = IP-auth)", True)
+    username = ask("username / auth user", required=register)
+    password = ask("password (hidden, never logged)", required=False, secret=True)
+
+    key = choose("inbound context — where the provider's calls are sent:", [
+        ("1", f"{DEFAULT_CONTEXT}   HA_IVR menu + voice assistant (the standard choice)"),
+        ("2", "other           type a custom context name (advanced)"),
+    ])
+    context = ask("context name", default=DEFAULT_CONTEXT) if key == "2" else DEFAULT_CONTEXT
+
+    block = build_trunk(name, host, username, password, register, context, port)
+    if not content.strip():
+        content = "; Managed by pbx — provider trunks only. Do not edit by hand.\n\n"
+    if not content.endswith("\n"):
+        content += "\n"
+    write_secure(TRUNKS_FILE, content + block, TRUNK_MODE)
+    ok(f"trunk '{name}' written (context={context})")
+    reload_pjsip()
+
+
+def trunk_list() -> None:
+    title("configured trunks")
+    names = trunk_names(trunks_text())
+    if not names:
+        note("no trunks configured.")
+        return
+    for n in names:
+        note(f"• {n}")
+    print("\n  --- pjsip show registrations ---")
+    print(asterisk_rx("pjsip show registrations") or "  (no output)")
+
+
+def trunk_remove(name: str | None = None) -> None:
+    title("remove a trunk")
+    content = trunks_text()
+    names = trunk_names(content)
+    if not names:
+        note("no trunks to remove.")
+        return
+    if name is None:
+        note("configured: " + ", ".join(names))
+        name = ask("trunk to remove")
+    if name not in names:
+        die(f"no such trunk: {name}")
+    if not yesno(f"remove trunk '{name}'?", False):
+        note("aborted.")
+        return
+    write_secure(TRUNKS_FILE, strip_trunk(content, name), TRUNK_MODE)
+    ok(f"trunk '{name}' removed")
+    reload_pjsip()
+
+
+# --- HA_IVR link ------------------------------------------------------------
+
+def haivr_load() -> configparser.ConfigParser:
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
+    if os.path.exists(HAIVR_CONFIG):
+        cp.read(HAIVR_CONFIG)
+    if not cp.has_section("ha_ivr"):
+        cp.add_section("ha_ivr")
+    return cp
+
+
+def mask_url(url: str) -> str:
+    """Hide the token in a pbx_url for safe display."""
+    return re.sub(r"(/pbx/).+$", r"\1****", url)
+
+
+def host_from_url(url: str) -> str:
+    m = re.search(r"https?://([^:/]+)", url or "")
+    return m.group(1) if m else ""
+
+
+def ha_host_from_dialplan() -> str:
+    """The HA address install.sh already baked in, for use as a prompt default.
+
+    install.sh takes the address as --ha and writes it into pjsip.conf (SIP
+    5060) and extensions.conf (AudioSocket 9010); this tool then needs the same
+    machine on HTTP 8123 for the ha_ivr API. Different layers, one host — so
+    read it back instead of making the operator type it twice.
+    """
+    try:
+        with open("/etc/asterisk/extensions.conf", encoding="utf-8") as fh:
+            m = re.search(r"^HA_IVR_AUDIOSOCKET\s*=\s*([^:\s;]+)", fh.read(), re.M)
+        return m.group(1) if m else ""
+    except OSError:
+        return ""
+
+
+def haivr_set() -> None:
+    title("configure the HA_IVR link")
+    note("From the ha_ivr record's first settings screen in Home Assistant.")
+    cp = haivr_load()
+    existing = cp["ha_ivr"].get("pbx_url", "")
+
+    # Prefer what is already configured; fall back to what install.sh wrote.
+    ha = ask("Home Assistant host / IP", example="192.168.1.10",
+             default=host_from_url(existing) or ha_host_from_dialplan())
+    token = ask("ha_ivr token OR the full pbx_url shown in HA (hidden)",
+                secret=True)
+
+    # The ha_ivr screen shows the WHOLE pbx_url, so users naturally paste that.
+    # Accept it: pull the host and token out instead of wrapping it again.
+    if "/api/ha_ivr/pbx/" in token:
+        hm = re.search(r"https?://([^:/]+)", token)
+        if hm:
+            ha = hm.group(1)
+        token = token.rsplit("/api/ha_ivr/pbx/", 1)[-1].strip().strip("/")
+        if not token:
+            die("could not find a token in that URL")
+    if not ha:
+        die("Home Assistant host/IP is required")
+
+    cp["ha_ivr"]["pbx_url"] = f"http://{ha}:8123/api/ha_ivr/pbx/{token}"
+    cp["ha_ivr"].setdefault("edge_say", EDGE_SAY_DEFAULT)
+    cp["ha_ivr"].setdefault("error_audio", ERROR_AUDIO_DEFAULT)
+
+    buf: list[str] = []
+
+    class _Sink:
+        def write(self, s: str) -> int:
+            buf.append(s)
+            return len(s)
+
+    cp.write(_Sink())
+    write_secure(HAIVR_CONFIG, "".join(buf), CONFIG_MODE)
+    ok(f"config written — token set for HA at {ha}")
+    note("The relay reads this on the next call; no Asterisk reload needed.")
+
+    if yesno("test the endpoint now?", True):
+        haivr_test()
+
+
+def haivr_show() -> None:
+    title("HA_IVR link")
+    cp = haivr_load()
+    url = cp["ha_ivr"].get("pbx_url", "")
+    if not url:
+        note("not configured yet.")
+        return
+    note(f"pbx_url     = {mask_url(url)}")
+    note(f"edge_say    = {cp['ha_ivr'].get('edge_say', EDGE_SAY_DEFAULT)}")
+    note(f"error_audio = {cp['ha_ivr'].get('error_audio', ERROR_AUDIO_DEFAULT)}")
+
+
+# Placeholder caller for the connectivity test. It is NOT a real number, so on
+# any box whose ha_ivr menu filters by caller ID this will correctly come back
+# "number not authorised" — which reads like a failure and is not one. Pass a
+# real (authorised) number to test the filtered path.
+TEST_CALLER = "0500000000"
+
+
+def haivr_test(caller: str = "") -> None:
+    title("test the HA_IVR link")
+    cp = haivr_load()
+    url = cp["ha_ivr"].get("pbx_url", "")
+    if not url or "REPLACE_WITH_TOKEN" in url:
+        die("no token set yet — run the config step first (menu option 4)")
+
+    caller = "".join(c for c in caller if c.isdigit()) or TEST_CALLER
+    if caller == TEST_CALLER:
+        note(f"using the placeholder caller {TEST_CALLER}.")
+        note("If your ha_ivr menu filters by number, it SHOULD reject this —")
+        note("that is the filter working, not a fault. To test the real path:")
+        note("    sudo ./pbx haivr test <your-number>")
+    else:
+        note(f"testing as caller {caller} (last 9: {caller[-9:]})")
+
+    body = json.dumps({"caller": caller, "path": "", "digit": "",
+                       "step": 1}).encode()
+    req = urllib.request.Request(url, data=body,
+                                 headers={"Content-Type": "application/json"})
+    note(f"POST {mask_url(url)}")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        ok(f"ha_ivr answered — HTTP {resp.status}")
+        note(f"say : {data.get('say', '')}")
+        note(f"menu: {data.get('menu')}   keys: {data.get('keys')}")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            bad("bad token — check it in the ha_ivr settings in Home Assistant")
+        elif exc.code == 404:
+            bad("not found — is the ha_ivr integration installed and running in HA?")
+        else:
+            bad(f"ha_ivr returned an error — HTTP {exc.code}")
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        bad("no answer from ha_ivr — check the address, the network, and the integration")
+        note(f"detail: {exc}")
+        sys.exit(1)
+
+
+# --- alert secret -----------------------------------------------------------
+
+def show_secret() -> None:
+    title("alert secret")
+    if not os.path.exists(ALERT_ENV):
+        die(f"{ALERT_ENV} does not exist — the alert service is not installed")
+    value = ""
+    with open(ALERT_ENV, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("PBX_ALERT_SECRET="):
+                value = line.split("=", 1)[1].strip()
+    if not value:
+        die("no PBX_ALERT_SECRET in the file")
+    note("Paste this into the 'alert service secret' field in the ha_ivr settings:")
+    print(f"\n    {value}\n")
+    note("It must match byte-for-byte on both sides, or every POST returns 403.")
+
+
+# --- status -----------------------------------------------------------------
+
+def status() -> None:
+    title("system status")
+    failures = 0
+
+    def check(label: str, passed: bool, hint: str = "", fatal: bool = True) -> None:
+        """Labels are neutral noun phrases so the mark carries the polarity:
+        '[ok] edge-tts' / '[!!] edge-tts - not installed'."""
+        nonlocal failures
+        if passed:
+            ok(label)
+        elif fatal:
+            failures += 1
+            bad(f"{label} - {hint}" if hint else label)
+        else:
+            warn(f"{label} - {hint}" if hint else label)
+
+    active = subprocess.run(["systemctl", "is-active", "--quiet", "asterisk"]).returncode == 0
+    check("asterisk service", active, "not running. start with: systemctl start asterisk")
+
+    modules = asterisk_rx("module show like opus")
+    check("Opus transcoder (codec_opus.so)", "codec_opus.so" in modules,
+          "not loaded (codec_opus is a separately-installed binary)")
+    check("res_format_attr_opus.so", "res_format_attr_opus.so" in modules, "not loaded")
+    check("Opus translation table",
+          "opus" in asterisk_rx("core show translation").lower(),
+          "empty - the build skipped the codec")
+
+    audiosocket = asterisk_rx("module show like audiosocket")
+    check("AudioSocket modules", audiosocket.count("Running") >= 3, "not all loaded")
+
+    check("HA_IVR relay (ha_relay.py)", os.access(RELAY, os.X_OK),
+          "missing. without it a call answers and hangs up with no menu")
+    deps = subprocess.run([sys.executable, "-c", "import asterisk.agi, requests"],
+                          capture_output=True).returncode == 0
+    check("relay python deps", deps, "pyst2 or requests missing")
+    check("edge-tts", shutil.which("edge-tts") is not None, "not installed. no speech")
+    check("sox", shutil.which("sox") is not None, "not installed. no speech")
+
+    url = haivr_load()["ha_ivr"].get("pbx_url", "")
+    check("ha_ivr token", bool(url) and "REPLACE_WITH_TOKEN" not in url,
+          "not set. run menu option 4")
+
+    names = trunk_names(trunks_text())
+    check(f"trunks configured: {len(names)}" + (f" ({', '.join(names)})" if names else ""),
+          bool(names), "none. run menu option 1", fatal=False)
+
+    if os.path.exists("/etc/systemd/system/call-trigger.service"):
+        running = subprocess.run(["systemctl", "is-active", "--quiet", "call-trigger"]).returncode == 0
+        check("call-trigger alert service", running,
+              "not running. check the secret, then: systemctl restart call-trigger",
+              fatal=False)
+    check("Asterisk log rotation", os.path.exists("/etc/logrotate.d/asterisk"),
+          "not configured. logs will grow unbounded", fatal=False)
+
+    print()
+    if failures:
+        bad("1 critical check failed - see the marked line above" if failures == 1
+            else f"{failures} critical checks failed - see the marked lines above")
+        sys.exit(1)
+    ok("all critical checks passed")
+
+
+# --- installer front-end ----------------------------------------------------
+
+def run_install(extra_args: list[str]) -> None:
+    """Drive install.sh, showing progress instead of the full build log.
+
+    The engine already tees everything to /var/log/pbx-install.log, so here we
+    surface only what an operator watches for: the phase banners it prints as
+    '=== ... ===', and any PASS / FAIL / WARN / ERROR outcome. Roughly 400
+    lines of compiler output collapse to ~15. Nothing is rewritten: an
+    unrecognised line is either build noise (hidden, still in the log) or an
+    outcome (shown verbatim).
+    """
+    engine = os.path.join(SCRIPT_DIR, "install.sh")
+    if not os.path.exists(engine):
+        die(f"{engine} not found - extract the full tarball and run from that directory")
+
+    title("install the PBX")
+    note("Full output is logged to /var/log/pbx-install.log")
+
+    ha = ask("Home Assistant address (used for pjsip and AudioSocket)",
+             example="192.168.1.10")
+    if not re.fullmatch(r"[0-9A-Za-z.\-]+", ha):
+        die("not a valid address")
+
+    if not yesno("start the install? this changes the system", False):
+        note("aborted.")
+        return
+
+    print()
+    proc = subprocess.Popen(["/bin/bash", engine, "--ha", ha] + extra_args,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if re.match(r"^=== ", line):
+            note(f"... {line.strip('= ')}")
+        elif re.match(r"^\s*PASS:", line):
+            ok(line.strip()[len("PASS:"):].strip())
+        elif re.match(r"^\s*FAIL:", line):
+            bad(line.strip()[len("FAIL:"):].strip())
+        elif re.match(r"^\s*WARN(ING)?:", line):
+            warn(line.strip())
+        elif line.startswith("ERROR:"):
+            bad(line[len("ERROR:"):].strip())
+    rc = proc.wait()
+
+    print()
+    if rc == 0:
+        ok("install finished")
+        note("Next: configure ha_ivr (option 4), then add a trunk (option 1).")
+        note("The alert secret is shown by option 6.")
+    else:
+        bad(f"install FAILED - exit code {rc}")
+        note("Full output: /var/log/pbx-install.log")
+        sys.exit(rc)
+
+
+# --- menu / dispatch --------------------------------------------------------
+
+MENU = [
+    ("1", "add a provider trunk", trunk_add),
+    ("2", "list configured trunks", trunk_list),
+    ("3", "remove a trunk", lambda: trunk_remove(None)),
+    ("4", "configure the HA_IVR link", haivr_set),
+    ("5", "test the HA_IVR link", lambda: haivr_test(
+        ask("caller number to test as (blank = placeholder)", required=False))),
+    ("6", "show the alert secret", show_secret),
+    ("7", "system status", status),
+]
+
+
+def menu_loop() -> None:
+    while True:
+        title("PBX management")
+        for key, label, _ in MENU:
+            print(f"    {key}) {label}")
+        print("    0) quit")
+        choice = input("\nchoose: ").strip()
+        if choice in ("0", "q", ""):
+            return
+        for key, _, action in MENU:
+            if choice == key:
+                try:
+                    action()
+                except SystemExit:
+                    pass
+                except KeyboardInterrupt:
+                    note("\naborted.")
+                pause()
+                break
+        else:
+            note("no such choice")
+
+
+def usage() -> None:
+    print(__doc__.strip().splitlines()[0])
+    print("""
+usage:
+  sudo ./pbx                      interactive menu
+  sudo ./pbx trunk add|list|remove
+  sudo ./pbx haivr set|show|test [number]
+  sudo ./pbx secret               reveal the alert secret for HA
+  sudo ./pbx status               full health check
+  sudo ./pbx install [--force]    build and configure this box
+""")
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    # Help must work for anyone: needing sudo just to read the usage is a
+    # pointless wall, and it is the first thing a stuck operator tries.
+    if args and args[0] in ("-h", "--help", "help"):
+        usage()
+        return
+    require_root()
+    if not args:
+        menu_loop()
+        return
+
+    group, rest = args[0], args[1:]
+    sub = rest[0] if rest else ""
+
+    if group == "trunk":
+        {"add": trunk_add, "list": trunk_list,
+         "remove": lambda: trunk_remove(rest[1] if len(rest) > 1 else None),
+         "": trunk_add}.get(sub, usage)()
+    elif group == "haivr":
+        {"set": haivr_set, "show": haivr_show,
+         "test": lambda: haivr_test(rest[1] if len(rest) > 1 else ""),
+         "": haivr_set}.get(sub, usage)()
+    elif group == "secret":
+        show_secret()
+    elif group == "status":
+        status()
+    elif group == "install":
+        run_install([a for a in rest if a == "--force"])
+    else:
+        usage()
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\naborted.")
+        sys.exit(130)

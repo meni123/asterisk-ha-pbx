@@ -1,0 +1,7 @@
+[ha_ivr]
+; pbx_url: shown on the ha_ivr record's first settings screen (INTERNAL HA
+; address + token). Do NOT put a real token in the repo — set it on the box with:
+;     sudo ./setup-haivr.py
+pbx_url = http://HA_IP:8123/api/ha_ivr/pbx/REPLACE_WITH_TOKEN
+edge_say = /var/lib/asterisk/agi-bin/edge_say.sh
+error_audio = beeperr
