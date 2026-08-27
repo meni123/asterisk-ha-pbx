@@ -552,7 +552,7 @@ sudo systemctl status asterisk call-trigger          # שניהם active
 # תפריט:
 curl -X POST "http://HA_IP:8123/api/ha_ivr/pbx/<TOKEN>" \
   -H "Content-Type: application/json" \
-  -d '{"caller":"0500000000","path":"","step":1}'     # מחזיר JSON תפריט
+  -d '{"caller":"0501234567","path":"","step":1}'     # מחזיר JSON תפריט
 ```
 
 ואז: שיחה → תפריט → מקש העוזר → שיחה עם Assist. התראה מ-HA → צלצול
