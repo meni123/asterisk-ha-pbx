@@ -39,7 +39,11 @@ TTS_SCRIPT = os.environ.get("PBX_ALERT_TTS", "/var/lib/asterisk/agi-bin/edge_say
 # Caller ID used when a request does not name one. Operator-set in
 # /etc/pbx-alert.env (e.g. PBX_ALERT_CALLERID=<0501234567>). Many ITSPs accept
 # several configured identities, so producers may pick a different one per call.
-DEFAULT_CALLER_ID = os.environ.get("PBX_ALERT_CALLERID", "").strip() or "<0000000000>"
+# If the operator sets none, the HA leg omits the CallerID directive entirely so
+# the trunk dials with its own configured identity, instead of a placeholder like
+# 0000000000 that many ITSPs reject.
+ENV_CALLER_ID = os.environ.get("PBX_ALERT_CALLERID", "").strip()
+DEFAULT_CALLER_ID = ENV_CALLER_ID or "<0000000000>"
 KUMA_CHANNEL = "Local/999@from-ha-alerts"
 AUDIO_MAX_AGE = 6 * 3600
 
@@ -64,7 +68,7 @@ def clean_caller_id(raw):
     directives of their own. Anything else the ITSP accepts is left alone.
     """
     if raw is None or str(raw).strip() == "":
-        return DEFAULT_CALLER_ID
+        return ""
     value = str(raw).strip()
     if len(value) > 128:
         raise ValueError("caller_id too long")
@@ -197,7 +201,13 @@ def ha_alert(payload):
     # sanitise up front so validation errors and log lines only ever carry the
     # cleaned text; synth() cleans again (idempotent) as defence in depth.
     text = clean_text(field("alert_data", "text"))
-    caller_id = clean_caller_id(payload.get("caller_id"))
+    # A request may name a caller ID; otherwise fall back to the operator's env
+    # default. If neither is set, caller_id stays empty and the CallerID directive
+    # is omitted, so the trunk dials with its own identity instead of a placeholder
+    # the ITSP would reject.
+    caller_id = clean_caller_id(payload.get("caller_id")) or clean_caller_id(
+        ENV_CALLER_ID
+    )
     if not phone.isdigit():
         raise ValueError(f"phone must be digits, got {phone!r}")
     if not trunk.replace("_", "").isalnum():
@@ -206,9 +216,10 @@ def ha_alert(payload):
     # Synthesise BEFORE placing the call: instant speech on answer, and the
     # call file carries only a hash-named wav path — never producer text.
     base = synth(text)
-    place_call([
-        f"Channel: Local/{phone}@ha-outbound",
-        f"CallerID: {caller_id}",
+    lines = [f"Channel: Local/{phone}@ha-outbound"]
+    if caller_id:
+        lines.append(f"CallerID: {caller_id}")
+    lines += [
         "MaxRetries: 2",
         "RetryTime: 60",
         "WaitTime: 30",
@@ -217,8 +228,10 @@ def ha_alert(payload):
         "Priority: 1",
         f"Set: ALERT_FILE={base}",
         f"Set: HA_TRUNK={trunk}",
-    ])
-    log(f"queued ha call to {phone} via {trunk} as {caller_id}: {text[:40]}")
+    ]
+    place_call(lines)
+    log(f"queued ha call to {phone} via {trunk} "
+        f"as {caller_id or '(trunk default)'}: {text[:40]}")
 
 
 class Handler(BaseHTTPRequestHandler):
