@@ -172,12 +172,17 @@ def kuma_message(data):
 
 
 def speak(text):
-    """Kuma / manual-test leg: synthesise, then ring the hardcoded channel."""
+    """Kuma / manual-test leg: synthesise, then ring the hardcoded channel.
+
+    One ring, no retries. Uptime Kuma notifies again on every failed check
+    for as long as the service stays down, so a retry here only adds a second
+    call about the same beat — and the caller cannot tell the two apart.
+    """
     base = synth(text)
     place_call([
         f"Channel: {KUMA_CHANNEL}",
         f"CallerID: {DEFAULT_CALLER_ID}",
-        "MaxRetries: 2",
+        "MaxRetries: 0",
         "RetryTime: 60",
         "WaitTime: 30",
         "Application: Playback",
@@ -216,11 +221,20 @@ def ha_alert(payload):
     # Synthesise BEFORE placing the call: instant speech on answer, and the
     # call file carries only a hash-named wav path — never producer text.
     base = synth(text)
+    # How many times to ring back when nobody answers. Default 0 - one ring,
+    # which is what every other provider does; a call that keeps coming back is
+    # an explicit request, not a surprise. Clamped so a bad value cannot turn an
+    # alert into a loop.
+    try:
+        retries = max(0, min(5, int(payload.get("retries", 0) or 0)))
+    except (TypeError, ValueError):
+        retries = 0
+
     lines = [f"Channel: Local/{phone}@ha-outbound"]
     if caller_id:
         lines.append(f"CallerID: {caller_id}")
     lines += [
-        "MaxRetries: 2",
+        f"MaxRetries: {retries}",
         "RetryTime: 60",
         "WaitTime: 30",
         "Context: tts-alerts",
@@ -231,7 +245,44 @@ def ha_alert(payload):
     ]
     place_call(lines)
     log(f"queued ha call to {phone} via {trunk} "
-        f"as {caller_id or '(trunk default)'}: {text[:40]}")
+        f"as {caller_id or '(trunk default)'}"
+        f"{f', {retries} retries' if retries else ''}: {text[:40]}")
+
+
+def asterisk_health():
+    """(תקין, פירוט) — האם האסטריק חי ועונה.
+
+    שתי בדיקות, כי הן שתי תקלות שונות. תהליך, כי יחידת LSB מדווחת
+    `active (exited)` גם כשאין תהליך כלל — המצב ששרד כאן שלושה
+    ימים בלי שאיש ידע. ואז ה-CLI, כי תהליך שקיים אינו בהכרח תהליך
+    שעובד: אסטריק תקוע מחזיק את מקומו בטבלת התהליכים ואינו מקבל
+    שיחה אחת.
+
+    הפירוט נכנס לגוף התשובה, כדי שההתראה של המנטר תאמר איזו משתי
+    התקלות זו ולא רק ששבור.
+    """
+    try:
+        found = subprocess.run(
+            ["pgrep", "-x", "asterisk"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, f"cannot check: {err}"
+    if found.returncode != 0:
+        return False, "asterisk is not running"
+
+    try:
+        # cwd מפורש: ספריית העבודה של השירות אינה נגישה למשתמש
+        # שלו, והאסטריק מדפיס על כך אזהרה לפני שהוא עונה.
+        answer = subprocess.run(
+            ["asterisk", "-rx", "core show uptime"],
+            capture_output=True, text=True, timeout=10, check=False, cwd="/",
+        )
+    except (OSError, subprocess.SubprocessError) as err:
+        return False, f"asterisk is not responding: {err}"
+    if answer.returncode != 0 or "uptime" not in answer.stdout.lower():
+        return False, "asterisk is running but not responding"
+    return True, "ok"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -279,6 +330,14 @@ class Handler(BaseHTTPRequestHandler):
         route = self._route()
         if route == "/health":
             return self._reply(200, "ok")
+        if route == "/health/asterisk":
+            # Deliberately separate from /health. That one says this webhook
+            # is alive, which is not the same question at all: on one box here
+            # call_trigger served happily for three days while Asterisk was
+            # dead and no call could arrive. An external monitor needs to ask
+            # about the PBX, not about its doorbell.
+            alive, detail = asterisk_health()
+            return self._reply(200 if alive else 503, detail)
         if route != "/test":
             return self._reply(404, "no such route")
         try:
