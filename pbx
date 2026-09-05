@@ -220,6 +220,28 @@ def build_trunk(name: str, host: str, username: str, password: str,
             "retry_interval=60",
             "forbidden_retry_interval=300",
             "expiration=60",                 # 1-min re-register holds the NAT pinhole
+            # Left at the Asterisk default on purpose. The counter is
+            # consecutive — it resets to 0 on every successful registration —
+            # so ten is ten failures in a row, not ten over the trunk's life.
+            # That is the brake that matters: with auth_rejection_permanent
+            # off, credentials that are genuinely wrong would otherwise be
+            # re-sent forever, and an ITSP is right to read that as an attack
+            # and block the IP. Ten minutes of trying, then stop and let the
+            # watchdog take over on a backoff.
+            "max_retries=10",
+            # Without this a fatal 4xx/5xx/6xx is never retried at all.
+            # forbidden_retry_interval still takes precedence for a 403.
+            "fatal_retry_interval=30",
+            # The one that actually bit us. Default is "yes", and the Asterisk
+            # docs are blunt about what that means: "registration will not be
+            # attempted again until the configuration is reloaded". A single
+            # 401 — which an ITSP can emit during its own nightly maintenance,
+            # with perfectly valid credentials — kills the trunk until a human
+            # notices. Ours died at 04:14 three nights running.
+            # The trade-off: genuinely wrong credentials now retry once a
+            # minute instead of stopping. retry_interval keeps that to a
+            # trickle, and the watchdog calls you either way.
+            "auth_rejection_permanent=no",
             "line=yes",
             f"endpoint={name}",
             "",
