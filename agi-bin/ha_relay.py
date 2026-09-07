@@ -84,7 +84,11 @@ def tts(text: str) -> str:
     if os.path.exists(produced):
         return f"/tmp/{hint}"
     try:
-        subprocess.run(["/bin/bash", EDGE_SAY, text, hint], timeout=15, check=False)
+        # תקרה רחבה: מנוע הקראה מקומי מסנתז כ-20 תווים לשנייה, ולכן
+        # 15 שניות נגמרות סביב 280 תווים — פחות מתפריט ארוך או
+        # משלוחה שמקריאה רשימה. ההמתנה משולמת פעם אחת, כי התוצאה
+        # נשמרת ב-cache לפי תוכן.
+        subprocess.run(["/bin/bash", EDGE_SAY, text, hint], timeout=60, check=False)
     except Exception as err:  # noqa: BLE001
         agi.verbose(f"TTS failed: {err}")
     return f"/tmp/{hint}" if os.path.exists(produced) else ERROR_AUDIO
